@@ -26,6 +26,7 @@
 
 #include <getopt.h>
 #include <signal.h>
+#include <unistd.h>
 #ifdef HAVE_NETINET_IN_H
 #  include <netinet/in.h>
 #endif // HAVE_NETINET_IN_H
@@ -98,7 +99,8 @@ Config::Config()
       verbose(false),
       timing_script(false),
       base_uri_unix(false),
-      unix_addr{} {}
+      unix_addr{},
+      use_many_request_file(false) {}
 
 Config::~Config() {
   if (addrs) {
@@ -374,7 +376,8 @@ Client::Client(uint32_t id, Worker *worker, size_t req_todo)
       id(id),
       fd(-1),
       new_connection_requested(false),
-      final(false) {
+      final(false),
+      current_request_data(0) {
   if (req_todo == 0) { // this means infinite number of requests are to be made
     // This ensures that number of requests are unbounded
     // Just a positive number is fine, we chose the first positive number
@@ -1792,6 +1795,34 @@ int parse_header_table_size(uint32_t &dst, const char *opt,
 } // namespace
 
 namespace {
+bool read_request_data_from_many_requests_file(
+    int fd, std::vector<PostRequestData> &requests) {
+
+  size_t n;
+  uint32_t v, request_count;
+  off_t offset = 0;
+
+  n = pread(fd, &request_count, 4, offset);
+  if (n != 4) {
+    return false;
+  }
+
+  offset += 4;
+  for (size_t i = 0; i < request_count; i++) {
+    n = pread(fd, &v, 4, offset);
+    if (n != 4) {
+      return false;
+    }
+    offset += 4;
+    requests.push_back({.data_length = v, .data_offset_in_file = offset});
+    offset += v;
+  }
+
+  return true;
+}
+} // namespace
+
+namespace {
 void print_version(std::ostream &out) {
   out << "h2load nghttp2/" NGHTTP2_VERSION << std::endl;
 }
@@ -1988,6 +2019,12 @@ Options:
   --connect-to=<HOST>[:<PORT>]
               Host and port to connect  instead of using the authority
               in <URI>.
+  --many-requests-data-file
+              Indicates that the data file given with --data should be
+              interpreted as a file with many requests. The format has
+              first, a u32 number stating the how many request data it
+              contains. Then, for  each request, a u32 number with the 
+              data length of that request followed by the data itself.
   -v, --verbose
               Output debug information.
   --version   Display version information and exit.
@@ -2047,6 +2084,7 @@ int main(int argc, char **argv) {
         {"warm-up-time", required_argument, &flag, 9},
         {"log-file", required_argument, &flag, 10},
         {"connect-to", required_argument, &flag, 11},
+        {"many-requests-data-file", no_argument, &flag, 12},
         {nullptr, 0, nullptr, 0}};
     int option_index = 0;
     auto c = getopt_long(argc, argv,
@@ -2287,6 +2325,10 @@ int main(int argc, char **argv) {
         config.connect_to_port = port;
         break;
       }
+      case 12:
+        // --many-requests-data-file
+        config.use_many_request_file = true;
+        break;
       }
       break;
     default:
@@ -2449,6 +2491,23 @@ int main(int argc, char **argv) {
     config.data_length = data_stat.st_size;
   }
 
+  if (config.use_many_request_file) {
+    if (config.data_fd == -1) {
+      std::cerr
+          << "--many-requests-data-file 11: requires a valid file given with -d"
+          << std::endl;
+      exit(EXIT_FAILURE);
+    }
+
+    bool succeed = read_request_data_from_many_requests_file(
+        config.data_fd, config.request_data);
+    if (!succeed) {
+      std::cerr << "Couldn't read data file for case where it has many requests"
+                << std::endl;
+      exit(EXIT_FAILURE);
+    }
+  }
+
   if (!logfile.empty()) {
     config.log_fd = open(logfile.c_str(), O_WRONLY | O_CREAT | O_APPEND,
                          S_IRUSR | S_IWUSR | S_IRGRP);
@@ -2598,6 +2657,31 @@ int main(int argc, char **argv) {
     }
 
     config.nva.push_back(std::move(nva));
+  }
+
+  for (auto &rd : config.request_data) {
+    rd.content_length_str = util::utos(rd.data_length);
+    for (auto &e : config.nva[0]) {
+      std::string content_length_header = "content-length";
+      std::string key = (char *)e.name;
+
+      if (content_length_header == key) {
+        rd.nva.push_back(http2::make_nv(StringRef::from_lit("content-length"),
+                                        StringRef{rd.content_length_str}));
+      } else {
+        rd.nva.push_back(e);
+      }
+    }
+    std::string str = config.h1reqs[0];
+    auto pos_content_length_header = str.find("Content-Length: ", 0);
+    pos_content_length_header += 16;
+    auto pos_first_crnl = str.find("\r\n", pos_content_length_header);
+    str.erase(pos_content_length_header,
+              pos_first_crnl - pos_content_length_header);
+    str.insert(pos_content_length_header, rd.content_length_str);
+    rd.h1req = str;
+
+    // std::cerr << "initialize : " << rd.h1req << std::endl;
   }
 
   // Don't DOS our server!

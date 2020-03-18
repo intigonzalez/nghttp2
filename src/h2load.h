@@ -61,11 +61,14 @@ constexpr auto BACKOFF_WRITE_BUFFER_THRES = 16_k;
 
 class Session;
 struct Worker;
+struct PostRequestData;
 
 struct Config {
   std::vector<std::vector<nghttp2_nv>> nva;
   std::vector<std::string> h1reqs;
   std::vector<ev_tstamp> timings;
+  // used hen the data file has data for more than one request
+  std::vector<PostRequestData> request_data;
   nghttp2::Headers custom_headers;
   std::string scheme;
   std::string host;
@@ -106,6 +109,8 @@ struct Config {
   bool verbose;
   bool timing_script;
   std::string base_uri;
+  // Indicates whther the data file has more than one data entry
+  bool use_many_request_file;
   // true if UNIX domain socket is used.  In this case, base_uri is
   // not used in usual way.
   bool base_uri_unix;
@@ -137,6 +142,15 @@ struct RequestStat {
   // true if stream was successfully closed.  This means stream was
   // not reset, but it does not mean HTTP level error (e.g., 404).
   bool completed;
+};
+
+struct PostRequestData {
+  uint32_t data_length;
+  uint64_t data_offset_in_file;
+
+  std::string content_length_str;
+  std::vector<nghttp2_nv> nva;
+  std::string h1req;
 };
 
 struct ClientStat {
@@ -336,6 +350,8 @@ struct Client {
   // true if the current connection will be closed, and no more new
   // request cannot be processed.
   bool final;
+
+  size_t current_request_data;
 
   enum { ERR_CONNECT_FAIL = -100 };
 

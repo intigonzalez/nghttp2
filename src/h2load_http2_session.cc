@@ -141,30 +141,67 @@ int before_frame_send_callback(nghttp2_session *session,
 
 namespace {
 ssize_t file_read_callback(nghttp2_session *session, int32_t stream_id,
-                           uint8_t *buf, size_t length, uint32_t *data_flags,
-                           nghttp2_data_source *source, void *user_data) {
+                           uint8_t *buf, size_t max_length_to_read,
+                           uint32_t *data_flags, nghttp2_data_source *source,
+                           void *user_data) {
   auto client = static_cast<Client *>(user_data);
   auto config = client->worker->config;
   auto req_stat = client->get_req_stat(stream_id);
   assert(req_stat);
+
+  int64_t request_content_length = config->data_length;
+  int64_t base_offset = 0;
+
+  // adjust a little bit the input to make the second case works
+  if (config->use_many_request_file) {
+    auto &request_data_info = config->request_data[source->fd];
+
+    request_content_length = request_data_info.data_length;
+    base_offset = request_data_info.data_offset_in_file;
+
+    auto original_length = max_length_to_read;
+    if (req_stat->data_offset + max_length_to_read > request_content_length) {
+      max_length_to_read = request_content_length - req_stat->data_offset;
+    }
+
+    // std::cerr << "Filling request. idx data: " << source->fd
+    //           << " data_length: " << request_content_length
+    //           << " base offset: " << request_data_info.data_offset_in_file
+    //           << " original_length: " << original_length
+    //           << " max_length_to_read: " << max_length_to_read
+    //           << " already read: " << req_stat->data_offset << std::endl;
+
+    // std::cerr << std::endl;
+  }
+
+  // std::cerr << "Arguments."
+  //           << " fd: " << config->data_fd << " buff: " << (uint64_t)buf
+  //           << " length: " << max_length_to_read
+  //           << " offset in file: " << (base_offset + req_stat->data_offset)
+  //           << std::endl;
+
   ssize_t nread;
-  while ((nread = pread(config->data_fd, buf, length, req_stat->data_offset)) ==
-             -1 &&
+  while ((nread = pread(config->data_fd, buf, max_length_to_read,
+                        base_offset + req_stat->data_offset)) == -1 &&
          errno == EINTR)
     ;
 
   if (nread == -1) {
+    // std::cerr << "weird : " << errno << std::endl;
     return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
   }
 
   req_stat->data_offset += nread;
 
-  if (req_stat->data_offset == config->data_length) {
+  // std::cerr << "Done: " << req_stat->data_offset
+  //           << " out of: " << request_content_length << std::endl;
+
+  if (req_stat->data_offset == request_content_length) {
     *data_flags |= NGHTTP2_DATA_FLAG_EOF;
     return nread;
   }
 
-  if (req_stat->data_offset > config->data_length || nread == 0) {
+  if (req_stat->data_offset > request_content_length || nread == 0) {
     return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
   }
 
@@ -267,15 +304,41 @@ int Http2Session::submit_request() {
   auto config = client_->worker->config;
   auto &nva = config->nva[client_->reqidx++];
 
+  auto nva_size = nva.size();
+  auto nva_data = nva.data();
+
   if (client_->reqidx == config->nva.size()) {
     client_->reqidx = 0;
   }
 
   nghttp2_data_provider prd{{0}, file_read_callback};
 
+  if (config->use_many_request_file) {
+    prd.source.fd =
+        client_->current_request_data++; // index in vector request_data
+    auto &rd = config->request_data[prd.source.fd];
+
+    nva_data = rd.nva.data();
+    nva_size = rd.nva.size();
+
+    if (client_->current_request_data >= config->request_data.size()) {
+      client_->current_request_data = 0;
+    }
+
+    // std::cerr << "Submitting request. idx data: " << prd.source.fd
+    //           << " data_length: " << rd.data_length
+    //           << " offset: " << rd.data_offset_in_file << std::endl;
+    // for (auto &nv : rd.nva) {
+    //   std::cerr << "Header. " << (char *)nv.name << ": " << (char *)nv.value
+    //             << std::endl;
+    // }
+    // std::cerr << std::endl;
+  }
+
   auto stream_id =
-      nghttp2_submit_request(session_, nullptr, nva.data(), nva.size(),
+      nghttp2_submit_request(session_, nullptr, nva_data, nva_size,
                              config->data_fd == -1 ? nullptr : &prd, nullptr);
+
   if (stream_id < 0) {
     return -1;
   }

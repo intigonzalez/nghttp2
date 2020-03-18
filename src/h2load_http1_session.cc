@@ -83,7 +83,17 @@ int htp_msg_completecb(llhttp_t *htp) {
   assert(req_stat);
 
   auto config = client->worker->config;
-  if (req_stat->data_offset >= config->data_length) {
+
+  auto request_content_length = config->data_length;
+
+  if (config->use_many_request_file) {
+    auto request_data_idx =
+        session->stream_resp_counter_ % config->request_data.size();
+
+    request_content_length = config->request_data[request_data_idx].data_length;
+  }
+
+  if (req_stat->data_offset >= request_content_length) {
     client->on_stream_close(session->stream_resp_counter_, true, client->final);
   }
 
@@ -176,7 +186,14 @@ void Http1Session::on_connect() { client_->signal_write(); }
 
 int Http1Session::submit_request() {
   auto config = client_->worker->config;
-  const auto &req = config->h1reqs[client_->reqidx];
+  auto &req = config->h1reqs[client_->reqidx];
+
+  if (config->use_many_request_file) {
+    auto request_data_idx = stream_req_counter_ % config->request_data.size();
+
+    req = config->request_data[request_data_idx].h1req;
+  }
+
   client_->reqidx++;
 
   if (client_->reqidx == config->h1reqs.size()) {
@@ -239,7 +256,17 @@ int Http1Session::on_write() {
     return 0;
   }
 
-  if (req_stat->data_offset < config->data_length) {
+  int64_t request_content_length = config->data_length;
+  int64_t base_offset = 0;
+
+  if (config->use_many_request_file) {
+    auto request_data_idx = stream_req_counter_ % config->request_data.size();
+
+    request_content_length = config->request_data[request_data_idx].data_length;
+    base_offset = config->request_data[request_data_idx].data_offset_in_file;
+  }
+
+  if (req_stat->data_offset < request_content_length) {
     auto req_stat = client_->get_req_stat(stream_req_counter_);
     auto &wb = client_->wb;
 
@@ -247,9 +274,19 @@ int Http1Session::on_write() {
     // family functions.
     std::array<uint8_t, 16_k> buf;
 
+    auto length = buf.size();
+
+    // // adjust a little bit the input to make the second case works
+    if (config->use_many_request_file) {
+
+      if (req_stat->data_offset + length > request_content_length) {
+        length = request_content_length - req_stat->data_offset;
+      }
+    }
+
     ssize_t nread;
-    while ((nread = pread(config->data_fd, buf.data(), buf.size(),
-                          req_stat->data_offset)) == -1 &&
+    while ((nread = pread(config->data_fd, buf.data(), length,
+                          base_offset + req_stat->data_offset)) == -1 &&
            errno == EINTR)
       ;
 
@@ -265,7 +302,7 @@ int Http1Session::on_write() {
       std::cout << "[send " << nread << " byte(s)]" << std::endl;
     }
 
-    if (req_stat->data_offset == config->data_length) {
+    if (req_stat->data_offset == request_content_length) {
       // increment for next request
       stream_req_counter_ += 2;
 
