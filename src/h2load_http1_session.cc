@@ -80,6 +80,12 @@ int htp_msg_completecb(llhttp_t *htp) {
   client->final = llhttp_should_keep_alive(htp) == 0;
   auto req_stat = client->get_req_stat(session->stream_resp_counter_);
 
+  // if (req_stat == nullptr) {
+  //   std::cerr << "Error reading stream_res " << session->stream_resp_counter_
+  //             << " while stream req is : " << session->stream_req_counter_
+  //             << std::endl;
+  // }
+
   assert(req_stat);
 
   auto config = client->worker->config;
@@ -93,7 +99,10 @@ int htp_msg_completecb(llhttp_t *htp) {
     request_content_length = config->request_data[request_data_idx].data_length;
   }
 
-  if (req_stat->data_offset >= request_content_length) {
+  if (req_stat && req_stat->data_offset >= request_content_length) {
+    // std::cerr << "Closing (1) of stream " << session->stream_resp_counter_
+    //           << " req counter " << session->stream_req_counter_ <<
+    //           std::endl;
     client->on_stream_close(session->stream_resp_counter_, true, client->final);
   }
 
@@ -188,18 +197,21 @@ int Http1Session::submit_request() {
   auto config = client_->worker->config;
   auto &req = config->h1reqs[client_->reqidx];
 
-  if (config->use_many_request_file) {
-    auto request_data_idx = stream_req_counter_ % config->request_data.size();
-
-    req = config->request_data[request_data_idx].h1req;
-  }
-
   client_->reqidx++;
 
   if (client_->reqidx == config->h1reqs.size()) {
     client_->reqidx = 0;
   }
 
+  if (config->use_many_request_file) {
+    auto request_data_idx = stream_req_counter_ % config->request_data.size();
+
+    req = config->request_data[request_data_idx].h1req;
+  }
+
+  // std::cerr << "Creating stream " << stream_req_counter_ << " headers: " <<
+  // req
+  //           << std::endl;
   client_->on_request(stream_req_counter_);
 
   auto req_stat = client_->get_req_stat(stream_req_counter_);
@@ -272,16 +284,15 @@ int Http1Session::on_write() {
 
     // TODO unfortunately, wb has no interface to use with read(2)
     // family functions.
-    std::array<uint8_t, 16_k> buf;
+    std::array<uint8_t, 128_k> buf;
 
     auto length = buf.size();
 
     // // adjust a little bit the input to make the second case works
-    if (config->use_many_request_file) {
+    if (config->use_many_request_file &&
+        req_stat->data_offset + length > request_content_length) {
 
-      if (req_stat->data_offset + length > request_content_length) {
-        length = request_content_length - req_stat->data_offset;
-      }
+      length = request_content_length - req_stat->data_offset;
     }
 
     ssize_t nread;
@@ -302,11 +313,13 @@ int Http1Session::on_write() {
       std::cout << "[send " << nread << " byte(s)]" << std::endl;
     }
 
-    if (req_stat->data_offset == request_content_length) {
+    if (req_stat->data_offset >= request_content_length) {
       // increment for next request
       stream_req_counter_ += 2;
 
       if (stream_resp_counter_ == stream_req_counter_) {
+        // std::cerr << "Closing (1) of stream " << stream_resp_counter_
+        //           << std::endl;
         // Response has already been received
         client_->on_stream_close(stream_resp_counter_ - 2, true,
                                  client_->final);
